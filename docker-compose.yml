@@ -1,0 +1,97 @@
+services:
+  # Cache for answered queries. A repeated question skips retrieval and the
+  # LLM. The API degrades gracefully if this is down, so it is not a hard
+  # dependency for correctness -- only for the speed-up.
+  redis:
+    image: redis:7-alpine
+    # appendonly persists the cache across restarts; a cold cache would just
+    # be re-warmed, so this is a convenience rather than a requirement.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      target: runtime
+    # Distinct image name per service. api and ui build the same runtime
+    # stage but must not share a tag, or a parallel `docker compose build`
+    # races two writes to one tag ("image already exists").
+    image: docurag-api:latest
+    ports:
+      - "8000:8000"
+    # Keys are injected at runtime. They are never copied into the image
+    # (.env is in .dockerignore and no ARG/ENV carries them at build time).
+    env_file:
+      - .env
+    environment:
+      # Points the cache at the redis service; the code defaults to
+      # redis://localhost:6379 when this is unset (e.g. outside compose).
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # RAGConfig.persist_directory defaults to "ChromaDB", so this is
+      # the store the API reads and writes.
+      - api-store:/app/ChromaDB
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      target: runtime
+    image: docurag-ui:latest
+    command:
+      - streamlit
+      - run
+      - app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # app.py hardcodes RAGConfig(persist_directory="chroma_db"), a
+      # different store from the API's. They are kept as separate volumes
+      # so Streamlit uploads stay out of the API's corpus (current
+      # behaviour) and two processes never write one SQLite file.
+      - ui-store:/app/chroma_db
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # Runs the suite inside the image so CI can reuse exactly what ships.
+  # Under a profile so `docker compose up` does not start it.
+  #   docker compose run --rm test
+  test:
+    build:
+      context: .
+      target: test
+    image: docurag-test:latest
+    profiles: ["test"]
+    # No env_file: the suite must stay runnable with no credentials.
+    command: ["pytest", "--cov"]
+
+volumes:
+  api-store:
+  ui-store:
+  redis-data:
